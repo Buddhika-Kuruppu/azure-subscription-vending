@@ -1,0 +1,548 @@
+trigger:
+- none
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+- name: terraformAction
+  displayName: 'Terraform Action'
+  type: string
+  default: 'apply'
+  values:
+  - apply
+  - destroy
+
+- name: confirmDestroy
+  displayName: 'Confirm Destroy (Required for destroy action)'
+  type: boolean
+  default: false
+
+- name: tfstateFileName
+  displayName: 'Terraform State File Name'
+  type: string
+  default: ''
+
+variables:
+  - group: variable-group
+
+stages:
+- stage: validate
+  displayName: 'Validate Parameters and Extract Subscription Alias'
+  condition: always()
+  jobs:
+  - job: ValidateInputs
+    displayName: 'Validate Inputs and Extract Subscription Info'
+    steps:
+    # Extract subscription alias from terraform.tfvars
+    - script: |
+        echo "=== EXTRACTING SUBSCRIPTION ALIAS FROM TERRAFORM.TFVARS ==="
+        
+        TFVARS_PATH="$(Build.SourcesDirectory)/product-lines/corpworkloads/terraform.tfvars"
+        
+        if [ ! -f "$TFVARS_PATH" ]; then
+          echo "##vso[task.logissue type=error]❌ terraform.tfvars file not found at: $TFVARS_PATH"
+          exit 1
+        fi
+        
+        echo "Found terraform.tfvars at: $TFVARS_PATH"
+        echo "Content preview:"
+        head -20 "$TFVARS_PATH"
+        
+        # Extract subscription alias (assuming it's defined as subscription_alias = "value")
+        SUBSCRIPTION_ALIAS=$(grep -E '^[[:space:]]*subscription_alias[[:space:]]*=' "$TFVARS_PATH" | sed -E 's/^[[:space:]]*subscription_alias[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/' | tr -d ' ')
+        
+        if [ -z "$SUBSCRIPTION_ALIAS" ]; then
+          echo "##vso[task.logissue type=error]❌ Could not extract subscription_alias from terraform.tfvars"
+          echo "##vso[task.logissue type=error]Please ensure terraform.tfvars contains: subscription_alias = \"your-alias\""
+          exit 1
+        fi
+        
+        echo "✅ Extracted subscription alias: $SUBSCRIPTION_ALIAS"
+        
+        # Generate or validate tfstate file name
+        if [ -z "${{ parameters.tfstateFileName }}" ] || [ "${{ parameters.tfstateFileName }}" = "" ]; then
+          # Auto-generate tfstate name from subscription alias
+          GENERATED_TFSTATE="${SUBSCRIPTION_ALIAS}.tfstate"
+          echo "🔧 Auto-generating tfstate file name: $GENERATED_TFSTATE"
+          FINAL_TFSTATE_KEY="$GENERATED_TFSTATE"
+        else
+          # Validate provided tfstate name matches subscription alias
+          PROVIDED_TFSTATE="${{ parameters.tfstateFileName }}"
+          
+          # Check if tfstate name contains the subscription alias
+          if [[ "$PROVIDED_TFSTATE" == *"$SUBSCRIPTION_ALIAS"* ]]; then
+            echo "✅ Provided tfstate file name contains subscription alias: $PROVIDED_TFSTATE"
+            FINAL_TFSTATE_KEY="$PROVIDED_TFSTATE"
+          else
+            echo "##vso[task.logissue type=error]❌ Tfstate file name must contain subscription alias"
+            echo "##vso[task.logissue type=error]Expected: tfstate name containing '$SUBSCRIPTION_ALIAS'"
+            echo "##vso[task.logissue type=error]Provided: '$PROVIDED_TFSTATE'"
+            echo "##vso[task.logissue type=error]Suggested: '${SUBSCRIPTION_ALIAS}.tfstate' or '${SUBSCRIPTION_ALIAS}-vnet.tfstate'"
+            exit 1
+          fi
+        fi
+        
+        # Validate tfstate file format
+        if [[ ! "$FINAL_TFSTATE_KEY" == *.tfstate ]]; then
+          echo "##vso[task.logissue type=error]❌ State file name must end with '.tfstate' extension"
+          echo "##vso[task.logissue type=error]Generated/Provided: '$FINAL_TFSTATE_KEY'"
+          exit 1
+        fi
+        
+        # Validate destroy confirmation
+        if [ "${{ parameters.terraformAction }}" = "destroy" ] && [ "${{ parameters.confirmDestroy }}" != "True" ]; then
+          echo "##vso[task.logissue type=error]❌ Destroy action requires confirmation. Please check 'Confirm Destroy' checkbox."
+          exit 1
+        fi
+        
+        echo "✅ All parameters validated successfully"
+        echo "Selected action: ${{ parameters.terraformAction }}"
+        echo "Subscription alias: $SUBSCRIPTION_ALIAS"
+        echo "Terraform state file: $FINAL_TFSTATE_KEY"
+        echo "Destroy confirmation: ${{ parameters.confirmDestroy }}"
+        
+        # CRITICAL FIX: Set variables as both output variables AND write to file
+        echo "##vso[task.setvariable variable=tfstateKey;isOutput=true]$FINAL_TFSTATE_KEY"
+        echo "##vso[task.setvariable variable=subscriptionAlias;isOutput=true]$SUBSCRIPTION_ALIAS"
+        
+        # Create artifact files with the values for cross-stage access
+        mkdir -p $(Build.ArtifactStagingDirectory)/config
+        echo "$FINAL_TFSTATE_KEY" > $(Build.ArtifactStagingDirectory)/config/tfstate_key.txt
+        echo "$SUBSCRIPTION_ALIAS" > $(Build.ArtifactStagingDirectory)/config/subscription_alias.txt
+        
+        echo "✅ Configuration saved to artifacts for cross-stage access"
+        
+      displayName: 'Extract and Validate Configuration'
+      name: validateConfig
+
+    - publish: $(Build.ArtifactStagingDirectory)/config
+      artifact: configurationArtifact
+      displayName: 'Publish Configuration Artifact'
+
+    - script: |
+        echo "=== FINAL CONFIGURATION SUMMARY ==="
+        echo "Backend Resource Group: $(BACKEND_RESOURCE_GROUP)"
+        echo "Backend Storage Account: $(BACKEND_STORAGE_ACCOUNT)"
+        echo "Backend Container: $(BACKEND_CONTAINER_NAME)"
+        echo "Terraform State Key: $(validateConfig.tfstateKey)"
+        echo "Subscription Alias: $(validateConfig.subscriptionAlias)"
+        echo "Working Directory: $(Build.SourcesDirectory)/product-lines/corpworkloads"
+        echo "Service Connection: authorization-connection"
+        
+        # Additional validation of backend variables
+        if [ -z "$(BACKEND_RESOURCE_GROUP)" ] || [ -z "$(BACKEND_STORAGE_ACCOUNT)" ] || [ -z "$(BACKEND_CONTAINER_NAME)" ]; then
+          echo "##vso[task.logissue type=error]❌ Backend configuration variables are missing from variable group"
+          echo "##vso[task.logissue type=error]Please check variable group: subscription-with-VNET-var-group"
+          exit 1
+        fi
+        
+        echo "✅ Backend configuration validated"
+      displayName: 'Display and Validate Final Configuration'
+
+- stage: plan
+  displayName: 'Terraform Plan'
+  dependsOn: validate
+  condition: |
+    and(
+      succeeded(),
+      eq('${{ parameters.terraformAction }}', 'apply')
+    )
+  variables:
+    # PRIMARY FIX: Use both methods to ensure variable availability
+    - name: tfstateKey
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.tfstateKey'] ]
+    - name: subscriptionAlias
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.subscriptionAlias'] ]
+  jobs:
+  - job: Plan
+    displayName: 'Terraform Init and Plan'
+    steps:
+    - download: current
+      artifact: configurationArtifact
+      displayName: 'Download Configuration'
+      
+    - script: |
+        echo "=== PLAN STAGE VARIABLE DEBUG ==="
+        echo "Stage dependency tfstateKey: '$(tfstateKey)'"
+        echo "Stage dependency subscriptionAlias: '$(subscriptionAlias)'"
+        
+        # Read from artifact files as primary method
+        if [ -f "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt" ]; then
+          EFFECTIVE_TFSTATE_KEY=$(cat "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt")
+          echo "✅ Read tfstateKey from artifact: $EFFECTIVE_TFSTATE_KEY"
+        else
+          # Fallback to stage dependency
+          EFFECTIVE_TFSTATE_KEY="$(tfstateKey)"
+          echo "⚠️ Artifact not found, using stage dependency: $EFFECTIVE_TFSTATE_KEY"
+        fi
+        
+        if [ -f "$(Pipeline.Workspace)/configurationArtifact/subscription_alias.txt" ]; then
+          EFFECTIVE_SUBSCRIPTION_ALIAS=$(cat "$(Pipeline.Workspace)/configurationArtifact/subscription_alias.txt")
+          echo "✅ Read subscriptionAlias from artifact: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+        else
+          EFFECTIVE_SUBSCRIPTION_ALIAS="$(subscriptionAlias)"
+          echo "⚠️ Artifact not found, using stage dependency: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+        fi
+        
+        if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+          echo "##vso[task.logissue type=error]❌ tfstateKey is empty in plan stage - all methods failed"
+          exit 1
+        fi
+        
+        # Set effective variables for use in this job
+        echo "##vso[task.setvariable variable=EFFECTIVE_TFSTATE_KEY]$EFFECTIVE_TFSTATE_KEY"
+        echo "##vso[task.setvariable variable=EFFECTIVE_SUBSCRIPTION_ALIAS]$EFFECTIVE_SUBSCRIPTION_ALIAS"
+        
+        echo "✅ Using tfstateKey: $EFFECTIVE_TFSTATE_KEY"
+        echo "✅ Using subscriptionAlias: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+        
+      displayName: 'Resolve and Validate Plan Variables'
+      
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        backendServiceArm: 'authorization-connection'
+        backendAzureRmResourceGroupName: '$(BACKEND_RESOURCE_GROUP)'
+        backendAzureRmStorageAccountName: '$(BACKEND_STORAGE_ACCOUNT)'
+        backendAzureRmContainerName: '$(BACKEND_CONTAINER_NAME)'
+        backendAzureRmKey: '$(EFFECTIVE_TFSTATE_KEY)'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        environmentServiceNameAzureRM: 'authorization-connection'
+        commandOptions: '-out=$(Build.ArtifactStagingDirectory)/tfplan'
+    
+    - publish: $(Build.ArtifactStagingDirectory)/tfplan
+      artifact: terraformPlanArtifact
+
+- stage: planDestroy
+  displayName: 'Terraform Plan Destroy'
+  dependsOn: validate
+  condition: |
+    and(
+      succeeded(),
+      eq('${{ parameters.terraformAction }}', 'destroy')
+    )
+  variables:
+    - name: tfstateKey
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.tfstateKey'] ]
+    - name: subscriptionAlias
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.subscriptionAlias'] ]
+  jobs:
+  - job: PlanDestroy
+    displayName: 'Terraform Init and Plan Destroy'
+    steps:
+    - download: current
+      artifact: configurationArtifact
+      displayName: 'Download Configuration'
+      
+    - script: |
+        echo "=== PLAN DESTROY STAGE VARIABLE DEBUG ==="
+        echo "Stage dependency tfstateKey: '$(tfstateKey)'"
+        
+        # Read from artifact files as primary method
+        if [ -f "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt" ]; then
+          EFFECTIVE_TFSTATE_KEY=$(cat "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt")
+          echo "✅ Read tfstateKey from artifact: $EFFECTIVE_TFSTATE_KEY"
+        else
+          EFFECTIVE_TFSTATE_KEY="$(tfstateKey)"
+          echo "⚠️ Artifact not found, using stage dependency: $EFFECTIVE_TFSTATE_KEY"
+        fi
+        
+        if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+          echo "##vso[task.logissue type=error]❌ tfstateKey is empty in planDestroy stage"
+          exit 1
+        fi
+        
+        echo "##vso[task.setvariable variable=EFFECTIVE_TFSTATE_KEY]$EFFECTIVE_TFSTATE_KEY"
+        echo "✅ Using tfstateKey: $EFFECTIVE_TFSTATE_KEY"
+        
+      displayName: 'Resolve Plan Destroy Variables'
+      
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        backendServiceArm: 'authorization-connection'
+        backendAzureRmResourceGroupName: '$(BACKEND_RESOURCE_GROUP)'
+        backendAzureRmStorageAccountName: '$(BACKEND_STORAGE_ACCOUNT)'
+        backendAzureRmContainerName: '$(BACKEND_CONTAINER_NAME)'
+        backendAzureRmKey: '$(EFFECTIVE_TFSTATE_KEY)'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Plan Destroy'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        environmentServiceNameAzureRM: 'authorization-connection'
+        commandOptions: '-destroy -out=$(Build.ArtifactStagingDirectory)/tfplan-destroy'
+    
+    - publish: $(Build.ArtifactStagingDirectory)/tfplan-destroy
+      artifact: terraformPlanDestroyArtifact
+
+- stage: Apply
+  displayName: 'Terraform Apply'
+  dependsOn: plan
+  condition: |
+    and(
+      succeeded(),
+      eq('${{ parameters.terraformAction }}', 'apply')
+    )
+  variables:
+    # CRITICAL FIX: Ensure proper variable resolution
+    - name: tfstateKey
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.tfstateKey'] ]
+    - name: subscriptionAlias
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.subscriptionAlias'] ]
+  jobs:
+  - job: Approval
+    pool: server
+    displayName: 'Wait for Manual Approval'
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: |
+          user@example.com
+        onTimeout: 'reject'
+        instructions: |
+          Please validate the build configuration and resume
+          
+          Subscription Alias: $(subscriptionAlias)
+          Terraform State File: $(tfstateKey)
+          Action: Apply
+
+  - job: Apply
+    dependsOn: Approval
+    displayName: 'Terraform Apply'
+    steps:
+    # CRITICAL FIX: Download configuration from artifact and resolve variables
+    - download: current
+      artifact: configurationArtifact
+      displayName: 'Download Configuration'
+      
+    - script: |
+        echo "=== APPLY STAGE VARIABLE RESOLUTION ==="
+        echo "Stage dependency tfstateKey: '$(tfstateKey)'"
+        echo "Stage dependency subscriptionAlias: '$(subscriptionAlias)'"
+        
+        # Primary method: Read from artifact files
+        if [ -f "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt" ]; then
+          EFFECTIVE_TFSTATE_KEY=$(cat "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt")
+          echo "✅ Read tfstateKey from artifact: '$EFFECTIVE_TFSTATE_KEY'"
+        else
+          echo "⚠️ Artifact file not found, trying stage dependency"
+          EFFECTIVE_TFSTATE_KEY="$(tfstateKey)"
+        fi
+        
+        if [ -f "$(Pipeline.Workspace)/configurationArtifact/subscription_alias.txt" ]; then
+          EFFECTIVE_SUBSCRIPTION_ALIAS=$(cat "$(Pipeline.Workspace)/configurationArtifact/subscription_alias.txt")
+          echo "✅ Read subscriptionAlias from artifact: '$EFFECTIVE_SUBSCRIPTION_ALIAS'"
+        else
+          echo "⚠️ Artifact file not found, trying stage dependency"
+          EFFECTIVE_SUBSCRIPTION_ALIAS="$(subscriptionAlias)"
+        fi
+        
+        # Final validation
+        if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+          echo "##vso[task.logissue type=error]❌ CRITICAL ERROR: tfstateKey is empty in Apply stage"
+          echo "##vso[task.logissue type=error]All variable resolution methods failed"
+          echo "##vso[task.logissue type=error]Check validate stage output and artifact creation"
+          
+          # Debug artifact contents
+          echo "=== ARTIFACT DEBUG ==="
+          if [ -d "$(Pipeline.Workspace)/configurationArtifact" ]; then
+            echo "Configuration artifact directory exists"
+            ls -la "$(Pipeline.Workspace)/configurationArtifact/"
+          else
+            echo "Configuration artifact directory NOT found"
+            echo "Available artifacts:"
+            ls -la "$(Pipeline.Workspace)/" || echo "No workspace directory"
+          fi
+          exit 1
+        fi
+        
+        # Validate backend configuration
+        if [ -z "$(BACKEND_RESOURCE_GROUP)" ] || [ -z "$(BACKEND_STORAGE_ACCOUNT)" ] || [ -z "$(BACKEND_CONTAINER_NAME)" ]; then
+          echo "##vso[task.logissue type=error]❌ Backend configuration variables are missing"
+          echo "##vso[task.logissue type=error]Check variable group: subscription-with-VNET-var-group"
+          echo "##vso[task.logissue type=error]BACKEND_RESOURCE_GROUP: '$(BACKEND_RESOURCE_GROUP)'"
+          echo "##vso[task.logissue type=error]BACKEND_STORAGE_ACCOUNT: '$(BACKEND_STORAGE_ACCOUNT)'"
+          echo "##vso[task.logissue type=error]BACKEND_CONTAINER_NAME: '$(BACKEND_CONTAINER_NAME)'"
+          exit 1
+        fi
+        
+        # Set final variables for Terraform tasks
+        echo "##vso[task.setvariable variable=FINAL_TFSTATE_KEY]$EFFECTIVE_TFSTATE_KEY"
+        echo "##vso[task.setvariable variable=FINAL_SUBSCRIPTION_ALIAS]$EFFECTIVE_SUBSCRIPTION_ALIAS"
+        
+        echo "✅ RESOLVED CONFIGURATION:"
+        echo "  Terraform State Key: '$EFFECTIVE_TFSTATE_KEY'"
+        echo "  Subscription Alias: '$EFFECTIVE_SUBSCRIPTION_ALIAS'"
+        echo "  Backend RG: '$(BACKEND_RESOURCE_GROUP)'"
+        echo "  Backend SA: '$(BACKEND_STORAGE_ACCOUNT)'"
+        echo "  Backend Container: '$(BACKEND_CONTAINER_NAME)'"
+        
+      displayName: 'Resolve Apply Variables - CRITICAL FIX'
+    
+    - download: current
+      artifact: terraformPlanArtifact
+    
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        backendServiceArm: 'authorization-connection'
+        backendAzureRmResourceGroupName: '$(BACKEND_RESOURCE_GROUP)'
+        backendAzureRmStorageAccountName: '$(BACKEND_STORAGE_ACCOUNT)'
+        backendAzureRmContainerName: '$(BACKEND_CONTAINER_NAME)'
+        backendAzureRmKey: '$(FINAL_TFSTATE_KEY)'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Apply'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        environmentServiceNameAzureRM: 'authorization-connection'
+        commandOptions: '$(Pipeline.Workspace)/terraformPlanArtifact/tfplan'
+
+- stage: Destroy
+  displayName: 'Terraform Destroy'
+  dependsOn: planDestroy
+  condition: |
+    and(
+      succeeded(),
+      eq('${{ parameters.terraformAction }}', 'destroy'),
+      eq('${{ parameters.confirmDestroy }}', true)
+    )
+  variables:
+    - name: tfstateKey
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.tfstateKey'] ]
+    - name: subscriptionAlias
+      value: $[ stageDependencies.validate.ValidateInputs.outputs['validateConfig.subscriptionAlias'] ]
+  jobs:
+  - job: DestroyApproval
+    pool: server
+    displayName: 'Wait for Destroy Approval'
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: |
+          b.kuruppu@securiton.com.au
+        onTimeout: 'reject'
+        instructions: |
+          ⚠️ WARNING: This will DESTROY all Terraform-managed resources! 
+          
+          Subscription Alias: $(subscriptionAlias)
+          Terraform State File: $(tfstateKey)
+          
+          Please confirm this is intentional and proceed only if you are certain.
+
+  - job: Destroy
+    dependsOn: DestroyApproval
+    displayName: 'Terraform Destroy'
+    steps:
+    - download: current
+      artifact: configurationArtifact
+      displayName: 'Download Configuration'
+      
+    - script: |
+        echo "=== DESTROY STAGE VARIABLE RESOLUTION ==="
+        echo "Stage dependency tfstateKey: '$(tfstateKey)'"
+        
+        # Read from artifact files as primary method
+        if [ -f "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt" ]; then
+          EFFECTIVE_TFSTATE_KEY=$(cat "$(Pipeline.Workspace)/configurationArtifact/tfstate_key.txt")
+          echo "✅ Read tfstateKey from artifact: $EFFECTIVE_TFSTATE_KEY"
+        else
+          EFFECTIVE_TFSTATE_KEY="$(tfstateKey)"
+          echo "⚠️ Artifact not found, using stage dependency: $EFFECTIVE_TFSTATE_KEY"
+        fi
+        
+        if [ -f "$(Pipeline.Workspace)/configurationArtifact/subscription_alias.txt" ]; then
+          EFFECTIVE_SUBSCRIPTION_ALIAS=$(cat "$(Pipeline.Workspace)/configurationArtifact/subscription_alias.txt")
+          echo "✅ Read subscriptionAlias from artifact: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+        else
+          echo "⚠️ Artifact not found for subscription alias"
+        fi
+        
+        if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+          echo "##vso[task.logissue type=error]❌ CRITICAL ERROR: tfstateKey is empty in Destroy stage"
+          exit 1
+        fi
+        
+        echo "##vso[task.setvariable variable=FINAL_TFSTATE_KEY]$EFFECTIVE_TFSTATE_KEY"
+        echo "##vso[task.setvariable variable=FINAL_SUBSCRIPTION_ALIAS]$EFFECTIVE_SUBSCRIPTION_ALIAS"
+        echo "✅ Using tfstateKey: $EFFECTIVE_TFSTATE_KEY"
+        
+      displayName: 'Resolve Destroy Variables'
+    
+    - download: current
+      artifact: terraformPlanDestroyArtifact
+    
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        backendServiceArm: 'authorization-connection'
+        backendAzureRmResourceGroupName: '$(BACKEND_RESOURCE_GROUP)'
+        backendAzureRmStorageAccountName: '$(BACKEND_STORAGE_ACCOUNT)'
+        backendAzureRmContainerName: '$(BACKEND_CONTAINER_NAME)'
+        backendAzureRmKey: '$(FINAL_TFSTATE_KEY)'
+    
+    - script: |
+        echo "⚠️  FINAL WARNING: Proceeding with DESTROY operation!"
+        echo "This will permanently delete all Terraform-managed resources."
+        echo "Subscription Alias: $(FINAL_SUBSCRIPTION_ALIAS)"
+        echo "Terraform State File: $(FINAL_TFSTATE_KEY)"
+        echo "Selected action: ${{ parameters.terraformAction }}"
+        echo "Destroy confirmed: ${{ parameters.confirmDestroy }}"
+        echo "Proceeding in 10 seconds..."
+        sleep 10
+      displayName: 'Final Destroy Warning'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Destroy'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(Build.SourcesDirectory)/product-lines/corpworkloads'
+        environmentServiceNameAzureRM: 'authorization-connection'
+        commandOptions: '$(Pipeline.Workspace)/terraformPlanDestroyArtifact/tfplan-destroy'
