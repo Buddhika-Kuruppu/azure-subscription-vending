@@ -22,7 +22,6 @@ This solution is intended for organizations managing Azure at scale using Landin
 ## 📦 Module Used
 
 <code>
-```hcl
 module "lz_vending" {
   source  = "Azure/lz-vending/azurerm"
   version = ">= 4.0.2"
