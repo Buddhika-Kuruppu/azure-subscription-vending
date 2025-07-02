@@ -41,3 +41,33 @@ variable "subscription_alias" {
   description = "subcription-vending-alias-01"
   type        = string
 }
+
+variable "vnet01_name" {
+  default     = "vnet"
+  description = "virtual Network Name"
+  type        = string
+}
+
+variable "vnet02_name" {
+  default     = "vnet"
+  description = "virtual Network Name"
+  type        = string
+}
+
+variable "network_rg_name" {
+  default     = "network_rg"
+  description = "Network Resource Group Name"
+  type        = string
+}
+
+variable "vnet01_address_space" {
+  description = "The address space that is used by the virtual network."
+  type        = list(string)
+  default     = ["192.168.1.0/24"]
+}
+
+variable "vnet02_address_space" {
+  description = "The address space that is used by the virtual network."
+  type        = list(string)
+  default     = ["10.10.10.0/24"]
+}

@@ -20,16 +20,16 @@ module "lz_vending" {
   virtual_network_enabled         = true
   virtual_networks = {
     one = {
-      name                    = "my-vnet"
+      name                    = var.vnet01_name
       location                = var.location
-      address_space           = ["192.168.1.0/24"]
-      resource_group_name     = "rg-networking-vnet-01"
+      address_space           = var.vnet01_address_space
+      resource_group_name     = var.network_rg_name
     }
     two = {
-      name                    = "my-vnet-2"
+      name                    = var.vnet02_name
       location                = var.location
-      address_space           = ["192.168.2.0/24"]
-      resource_group_name     = "rg-networking-vnet-01"
+      address_space           = var.vnet02_address_space
+      resource_group_name     = var.network_rg_name
     }
   }
   resource_group_creation_enabled = false
