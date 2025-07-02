@@ -21,12 +21,13 @@ This solution is intended for organizations managing Azure at scale using Landin
 
 ## 📦 Module Used
 
-```hcl
+<code>
 module "lz_vending" {
   source  = "Azure/lz-vending/azurerm"
   version = ">= 4.0.2"
   # additional inputs provided via terraform.tfvars
 }
+</code>
 
 # Terraform Azure DevOps Pipeline Guide
 
