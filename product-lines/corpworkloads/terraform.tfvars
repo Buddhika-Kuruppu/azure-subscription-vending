@@ -21,3 +21,14 @@ subscription_display_name = "sample Subscription Name"
 
 # Alias for the Azure subscription (used for programmatic reference)
 subscription_alias = "sample-alias"
+
+#network Resource Group name
+network_rg_name = rg-networking-vnet-01
+
+#Virtual network Names
+vnet01_name = "contoso-vnet-aue-001"
+vnet02_name = "contoso-vnet-aue-002"
+
+#virtual network Address Spaces
+vnet01_address_space = [ "172.10.10.0/24" ]
+vnet02_address_space = [ "10.100.10.0/25" ]
