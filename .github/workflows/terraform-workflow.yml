@@ -1,0 +1,498 @@
+name: Terraform Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      terraformAction:
+        description: 'Terraform Action'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+      confirmDestroy:
+        description: 'Confirm Destroy (Required for destroy action)'
+        required: false
+        default: false
+        type: boolean
+      tfstateFileName:
+        description: 'Terraform State File Name'
+        required: false
+        default: ''
+        type: string
+
+env:
+  TF_VERSION: latest
+  WORKING_DIRECTORY: ./product-lines/corpworkloads
+  
+jobs:
+  validate:
+    name: Validate Parameters and Extract Subscription Alias
+    runs-on: ubuntu-latest
+    outputs:
+      tfstate-key: ${{ steps.validate-config.outputs.tfstate-key }}
+      subscription-alias: ${{ steps.validate-config.outputs.subscription-alias }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Extract and Validate Configuration
+        id: validate-config
+        run: |
+          echo "=== EXTRACTING SUBSCRIPTION ALIAS FROM TERRAFORM.TFVARS ==="
+          
+          TFVARS_PATH="${GITHUB_WORKSPACE}/product-lines/corpworkloads/terraform.tfvars"
+          
+          if [ ! -f "$TFVARS_PATH" ]; then
+            echo "::error::❌ terraform.tfvars file not found at: $TFVARS_PATH"
+            exit 1
+          fi
+          
+          echo "Found terraform.tfvars at: $TFVARS_PATH"
+          echo "Content preview:"
+          head -20 "$TFVARS_PATH"
+          
+          # Extract subscription alias (assuming it's defined as subscription_alias = "value")
+          SUBSCRIPTION_ALIAS=$(grep -E '^[[:space:]]*subscription_alias[[:space:]]*=' "$TFVARS_PATH" | sed -E 's/^[[:space:]]*subscription_alias[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/' | tr -d ' ')
+          
+          if [ -z "$SUBSCRIPTION_ALIAS" ]; then
+            echo "::error::❌ Could not extract subscription_alias from terraform.tfvars"
+            echo "::error::Please ensure terraform.tfvars contains: subscription_alias = \"your-alias\""
+            exit 1
+          fi
+          
+          echo "✅ Extracted subscription alias: $SUBSCRIPTION_ALIAS"
+          
+          # Generate or validate tfstate file name
+          if [ -z "${{ inputs.tfstateFileName }}" ] || [ "${{ inputs.tfstateFileName }}" = "" ]; then
+            # Auto-generate tfstate name from subscription alias
+            GENERATED_TFSTATE="${SUBSCRIPTION_ALIAS}.tfstate"
+            echo "🔧 Auto-generating tfstate file name: $GENERATED_TFSTATE"
+            FINAL_TFSTATE_KEY="$GENERATED_TFSTATE"
+          else
+            # Validate provided tfstate name matches subscription alias
+            PROVIDED_TFSTATE="${{ inputs.tfstateFileName }}"
+            
+            # Check if tfstate name contains the subscription alias
+            if [[ "$PROVIDED_TFSTATE" == *"$SUBSCRIPTION_ALIAS"* ]]; then
+              echo "✅ Provided tfstate file name contains subscription alias: $PROVIDED_TFSTATE"
+              FINAL_TFSTATE_KEY="$PROVIDED_TFSTATE"
+            else
+              echo "::error::❌ Tfstate file name must contain subscription alias"
+              echo "::error::Expected: tfstate name containing '$SUBSCRIPTION_ALIAS'"
+              echo "::error::Provided: '$PROVIDED_TFSTATE'"
+              echo "::error::Suggested: '${SUBSCRIPTION_ALIAS}.tfstate' or '${SUBSCRIPTION_ALIAS}-vnet.tfstate'"
+              exit 1
+            fi
+          fi
+          
+          # Validate tfstate file format
+          if [[ ! "$FINAL_TFSTATE_KEY" == *.tfstate ]]; then
+            echo "::error::❌ State file name must end with '.tfstate' extension"
+            echo "::error::Generated/Provided: '$FINAL_TFSTATE_KEY'"
+            exit 1
+          fi
+          
+          # Validate destroy confirmation
+          if [ "${{ inputs.terraformAction }}" = "destroy" ] && [ "${{ inputs.confirmDestroy }}" != "true" ]; then
+            echo "::error::❌ Destroy action requires confirmation. Please check 'Confirm Destroy' checkbox."
+            exit 1
+          fi
+          
+          echo "✅ All parameters validated successfully"
+          echo "Selected action: ${{ inputs.terraformAction }}"
+          echo "Subscription alias: $SUBSCRIPTION_ALIAS"
+          echo "Terraform state file: $FINAL_TFSTATE_KEY"
+          echo "Destroy confirmation: ${{ inputs.confirmDestroy }}"
+          
+          # Set outputs
+          echo "tfstate-key=$FINAL_TFSTATE_KEY" >> $GITHUB_OUTPUT
+          echo "subscription-alias=$SUBSCRIPTION_ALIAS" >> $GITHUB_OUTPUT
+          
+          # Create artifact files with the values for cross-job access
+          mkdir -p ./config
+          echo "$FINAL_TFSTATE_KEY" > ./config/tfstate_key.txt
+          echo "$SUBSCRIPTION_ALIAS" > ./config/subscription_alias.txt
+          
+          echo "✅ Configuration saved to artifacts for cross-job access"
+      
+      - name: Upload Configuration Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: configuration-artifact
+          path: ./config/
+          retention-days: 1
+      
+      - name: Display and Validate Final Configuration
+        run: |
+          echo "=== FINAL CONFIGURATION SUMMARY ==="
+          echo "Backend Resource Group: ${{ vars.BACKEND_RESOURCE_GROUP }}"
+          echo "Backend Storage Account: ${{ vars.BACKEND_STORAGE_ACCOUNT }}"
+          echo "Backend Container: ${{ vars.BACKEND_CONTAINER_NAME }}"
+          echo "Terraform State Key: ${{ steps.validate-config.outputs.tfstate-key }}"
+          echo "Subscription Alias: ${{ steps.validate-config.outputs.subscription-alias }}"
+          echo "Working Directory: ${{ env.WORKING_DIRECTORY }}"
+          echo "Service Connection: Will use Azure CLI/Service Principal"
+          
+          # Additional validation of backend variables
+          if [ -z "${{ vars.BACKEND_RESOURCE_GROUP }}" ] || [ -z "${{ vars.BACKEND_STORAGE_ACCOUNT }}" ] || [ -z "${{ vars.BACKEND_CONTAINER_NAME }}" ]; then
+            echo "::error::❌ Backend configuration variables are missing"
+            echo "::error::Please configure repository variables: BACKEND_RESOURCE_GROUP, BACKEND_STORAGE_ACCOUNT, BACKEND_CONTAINER_NAME"
+            exit 1
+          fi
+          
+          echo "✅ Backend configuration validated"
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: inputs.terraformAction == 'apply'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Download Configuration Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: configuration-artifact
+          path: ./config/
+      
+      - name: Resolve Plan Variables
+        id: resolve-vars
+        run: |
+          echo "=== PLAN STAGE VARIABLE DEBUG ==="
+          echo "Job output tfstateKey: '${{ needs.validate.outputs.tfstate-key }}'"
+          echo "Job output subscriptionAlias: '${{ needs.validate.outputs.subscription-alias }}'"
+          
+          # Read from artifact files as primary method
+          if [ -f "./config/tfstate_key.txt" ]; then
+            EFFECTIVE_TFSTATE_KEY=$(cat "./config/tfstate_key.txt")
+            echo "✅ Read tfstateKey from artifact: $EFFECTIVE_TFSTATE_KEY"
+          else
+            # Fallback to job output
+            EFFECTIVE_TFSTATE_KEY="${{ needs.validate.outputs.tfstate-key }}"
+            echo "⚠️ Artifact not found, using job output: $EFFECTIVE_TFSTATE_KEY"
+          fi
+          
+          if [ -f "./config/subscription_alias.txt" ]; then
+            EFFECTIVE_SUBSCRIPTION_ALIAS=$(cat "./config/subscription_alias.txt")
+            echo "✅ Read subscriptionAlias from artifact: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+          else
+            EFFECTIVE_SUBSCRIPTION_ALIAS="${{ needs.validate.outputs.subscription-alias }}"
+            echo "⚠️ Artifact not found, using job output: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+          fi
+          
+          if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+            echo "::error::❌ tfstateKey is empty in plan stage - all methods failed"
+            exit 1
+          fi
+          
+          # Set outputs for use in this job
+          echo "tfstate-key=$EFFECTIVE_TFSTATE_KEY" >> $GITHUB_OUTPUT
+          echo "subscription-alias=$EFFECTIVE_SUBSCRIPTION_ALIAS" >> $GITHUB_OUTPUT
+          
+          echo "✅ Using tfstateKey: $EFFECTIVE_TFSTATE_KEY"
+          echo "✅ Using subscriptionAlias: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ steps.resolve-vars.outputs.tfstate-key }}"
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+      
+      - name: Terraform Plan
+        run: |
+          terraform plan -out=tfplan
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+      
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-artifact
+          path: ${{ env.WORKING_DIRECTORY }}/tfplan
+          retention-days: 1
+
+  plan-destroy:
+    name: Terraform Plan Destroy
+    runs-on: ubuntu-latest
+    needs: validate
+    if: inputs.terraformAction == 'destroy'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Download Configuration Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: configuration-artifact
+          path: ./config/
+      
+      - name: Resolve Plan Destroy Variables
+        id: resolve-vars
+        run: |
+          echo "=== PLAN DESTROY STAGE VARIABLE DEBUG ==="
+          echo "Job output tfstateKey: '${{ needs.validate.outputs.tfstate-key }}'"
+          
+          # Read from artifact files as primary method
+          if [ -f "./config/tfstate_key.txt" ]; then
+            EFFECTIVE_TFSTATE_KEY=$(cat "./config/tfstate_key.txt")
+            echo "✅ Read tfstateKey from artifact: $EFFECTIVE_TFSTATE_KEY"
+          else
+            EFFECTIVE_TFSTATE_KEY="${{ needs.validate.outputs.tfstate-key }}"
+            echo "⚠️ Artifact not found, using job output: $EFFECTIVE_TFSTATE_KEY"
+          fi
+          
+          if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+            echo "::error::❌ tfstateKey is empty in planDestroy stage"
+            exit 1
+          fi
+          
+          echo "tfstate-key=$EFFECTIVE_TFSTATE_KEY" >> $GITHUB_OUTPUT
+          echo "✅ Using tfstateKey: $EFFECTIVE_TFSTATE_KEY"
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ steps.resolve-vars.outputs.tfstate-key }}"
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+      
+      - name: Terraform Plan Destroy
+        run: |
+          terraform plan -destroy -out=tfplan-destroy
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+      
+      - name: Upload Terraform Plan Destroy
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-destroy-artifact
+          path: ${{ env.WORKING_DIRECTORY }}/tfplan-destroy
+          retention-days: 1
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [validate, plan]
+    if: inputs.terraformAction == 'apply'
+    environment: production  # This creates a protection rule requiring manual approval
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Download Configuration Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: configuration-artifact
+          path: ./config/
+      
+      - name: Resolve Apply Variables
+        id: resolve-vars
+        run: |
+          echo "=== APPLY STAGE VARIABLE RESOLUTION ==="
+          echo "Job output tfstateKey: '${{ needs.validate.outputs.tfstate-key }}'"
+          echo "Job output subscriptionAlias: '${{ needs.validate.outputs.subscription-alias }}'"
+          
+          # Primary method: Read from artifact files
+          if [ -f "./config/tfstate_key.txt" ]; then
+            EFFECTIVE_TFSTATE_KEY=$(cat "./config/tfstate_key.txt")
+            echo "✅ Read tfstateKey from artifact: '$EFFECTIVE_TFSTATE_KEY'"
+          else
+            echo "⚠️ Artifact file not found, trying job output"
+            EFFECTIVE_TFSTATE_KEY="${{ needs.validate.outputs.tfstate-key }}"
+          fi
+          
+          if [ -f "./config/subscription_alias.txt" ]; then
+            EFFECTIVE_SUBSCRIPTION_ALIAS=$(cat "./config/subscription_alias.txt")
+            echo "✅ Read subscriptionAlias from artifact: '$EFFECTIVE_SUBSCRIPTION_ALIAS'"
+          else
+            echo "⚠️ Artifact file not found, trying job output"
+            EFFECTIVE_SUBSCRIPTION_ALIAS="${{ needs.validate.outputs.subscription-alias }}"
+          fi
+          
+          # Final validation
+          if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+            echo "::error::❌ CRITICAL ERROR: tfstateKey is empty in Apply stage"
+            echo "::error::All variable resolution methods failed"
+            echo "::error::Check validate stage output and artifact creation"
+            
+            # Debug artifact contents
+            echo "=== ARTIFACT DEBUG ==="
+            if [ -d "./config" ]; then
+              echo "Configuration artifact directory exists"
+              ls -la "./config/"
+            else
+              echo "Configuration artifact directory NOT found"
+            fi
+            exit 1
+          fi
+          
+          # Validate backend configuration
+          if [ -z "${{ vars.BACKEND_RESOURCE_GROUP }}" ] || [ -z "${{ vars.BACKEND_STORAGE_ACCOUNT }}" ] || [ -z "${{ vars.BACKEND_CONTAINER_NAME }}" ]; then
+            echo "::error::❌ Backend configuration variables are missing"
+            echo "::error::Check repository variables"
+            echo "::error::BACKEND_RESOURCE_GROUP: '${{ vars.BACKEND_RESOURCE_GROUP }}'"
+            echo "::error::BACKEND_STORAGE_ACCOUNT: '${{ vars.BACKEND_STORAGE_ACCOUNT }}'"
+            echo "::error::BACKEND_CONTAINER_NAME: '${{ vars.BACKEND_CONTAINER_NAME }}'"
+            exit 1
+          fi
+          
+          # Set outputs for Terraform tasks
+          echo "tfstate-key=$EFFECTIVE_TFSTATE_KEY" >> $GITHUB_OUTPUT
+          echo "subscription-alias=$EFFECTIVE_SUBSCRIPTION_ALIAS" >> $GITHUB_OUTPUT
+          
+          echo "✅ RESOLVED CONFIGURATION:"
+          echo "  Terraform State Key: '$EFFECTIVE_TFSTATE_KEY'"
+          echo "  Subscription Alias: '$EFFECTIVE_SUBSCRIPTION_ALIAS'"
+          echo "  Backend RG: '${{ vars.BACKEND_RESOURCE_GROUP }}'"
+          echo "  Backend SA: '${{ vars.BACKEND_STORAGE_ACCOUNT }}'"
+          echo "  Backend Container: '${{ vars.BACKEND_CONTAINER_NAME }}'"
+      
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-artifact
+          path: ./plan/
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ steps.resolve-vars.outputs.tfstate-key }}"
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+      
+      - name: Terraform Apply
+        run: |
+          terraform apply ../plan/tfplan
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    needs: [validate, plan-destroy]
+    if: inputs.terraformAction == 'destroy' && inputs.confirmDestroy == true
+    environment: production-destroy  # Separate environment for destroy operations
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Download Configuration Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: configuration-artifact
+          path: ./config/
+      
+      - name: Resolve Destroy Variables
+        id: resolve-vars
+        run: |
+          echo "=== DESTROY STAGE VARIABLE RESOLUTION ==="
+          echo "Job output tfstateKey: '${{ needs.validate.outputs.tfstate-key }}'"
+          
+          # Read from artifact files as primary method
+          if [ -f "./config/tfstate_key.txt" ]; then
+            EFFECTIVE_TFSTATE_KEY=$(cat "./config/tfstate_key.txt")
+            echo "✅ Read tfstateKey from artifact: $EFFECTIVE_TFSTATE_KEY"
+          else
+            EFFECTIVE_TFSTATE_KEY="${{ needs.validate.outputs.tfstate-key }}"
+            echo "⚠️ Artifact not found, using job output: $EFFECTIVE_TFSTATE_KEY"
+          fi
+          
+          if [ -f "./config/subscription_alias.txt" ]; then
+            EFFECTIVE_SUBSCRIPTION_ALIAS=$(cat "./config/subscription_alias.txt")
+            echo "✅ Read subscriptionAlias from artifact: $EFFECTIVE_SUBSCRIPTION_ALIAS"
+          else
+            echo "⚠️ Artifact not found for subscription alias"
+          fi
+          
+          if [ -z "$EFFECTIVE_TFSTATE_KEY" ]; then
+            echo "::error::❌ CRITICAL ERROR: tfstateKey is empty in Destroy stage"
+            exit 1
+          fi
+          
+          echo "tfstate-key=$EFFECTIVE_TFSTATE_KEY" >> $GITHUB_OUTPUT
+          echo "subscription-alias=$EFFECTIVE_SUBSCRIPTION_ALIAS" >> $GITHUB_OUTPUT
+          echo "✅ Using tfstateKey: $EFFECTIVE_TFSTATE_KEY"
+      
+      - name: Download Terraform Plan Destroy
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-destroy-artifact
+          path: ./plan/
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ steps.resolve-vars.outputs.tfstate-key }}"
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+      
+      - name: Final Destroy Warning
+        run: |
+          echo "⚠️  FINAL WARNING: Proceeding with DESTROY operation!"
+          echo "This will permanently delete all Terraform-managed resources."
+          echo "Subscription Alias: ${{ steps.resolve-vars.outputs.subscription-alias }}"
+          echo "Terraform State File: ${{ steps.resolve-vars.outputs.tfstate-key }}"
+          echo "Selected action: ${{ inputs.terraformAction }}"
+          echo "Destroy confirmed: ${{ inputs.confirmDestroy }}"
+          echo "Proceeding in 10 seconds..."
+          sleep 10
+      
+      - name: Terraform Destroy
+        run: |
+          terraform apply ../plan/tfplan-destroy
+        working-directory: ${{ env.WORKING_DIRECTORY }}
